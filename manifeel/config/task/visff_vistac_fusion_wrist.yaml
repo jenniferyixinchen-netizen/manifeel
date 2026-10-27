@@ -44,6 +44,8 @@ dataset:
   shape_meta: ${shape_meta}
   zarr_path: ${dataset_path}
   tacff_keys: *tacff_keys
+  # state/action normalizer fit on: all (same as baseline) | train (train episodes only)
+  lowdim_fit_on: all
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

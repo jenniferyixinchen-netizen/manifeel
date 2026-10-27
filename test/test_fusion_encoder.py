@@ -18,6 +18,7 @@ from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+from diffusion_policy.common.sampler import get_val_mask
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 CONFIG_DIR = str(pathlib.Path(__file__).resolve().parents[1].joinpath('manifeel', 'config'))
@@ -186,6 +187,63 @@ def main(args):
             per_c = x.permute(1, 0, 2, 3).reshape(3, -1)
             print(f'baseline visff TacFF ResNet input per-channel std: {per_c.std(1).numpy()} '
                   f'(range {x.min():+.3f}..{x.max():+.3f})')
+    # ---------------- 7. lowdim_fit_on: all vs train ----------------
+    check(cfg.task.dataset.lowdim_fit_on == 'all', 'fusion task default lowdim_fit_on = all')
+    # max_train_episodes=2 so that both val and unused (downsampled away) episodes exist
+    small = ['task.dataset.max_train_episodes=2']
+    bcfg = load_cfg('train_diffusion_workspace', overrides + small + ['task=visff_wrist'])
+    base_norm = instantiate(bcfg.task.dataset).get_normalizer()
+    tacff_params = dict()
+    for mode in ['all', 'train']:
+        print(f'--- lowdim_fit_on={mode} ---')
+        mcfg = load_cfg('train_diffusion_fusion_workspace',
+                        overrides + small + [f'task.dataset.lowdim_fit_on={mode}'])
+        ds = instantiate(mcfg.task.dataset)
+        val_mask = get_val_mask(n_episodes=ds.replay_buffer.n_episodes,
+                                val_ratio=mcfg.task.dataset.val_ratio, seed=mcfg.task.dataset.seed)
+        unused = ~ds.train_mask & ~val_mask
+        check(ds.train_mask.sum() == 2 and val_mask.sum() >= 1 and unused.sum() >= 1,
+              f'split: train={ds.train_mask.sum()} val={val_mask.sum()} unused={unused.sum()}')
+        idx = ds._train_frame_indices()
+        ends = ds.replay_buffer.episode_ends[:]
+        starts = np.concatenate([[0], ends[:-1]])
+        excluded = np.concatenate([np.arange(s, e) for s, e, m in zip(starts, ends, ~ds.train_mask) if m])
+        check(len(np.intersect1d(idx, excluded)) == 0
+              and len(idx) + len(excluded) == ds.replay_buffer.n_steps,
+              'train frame indices exclude every val / unused episode frame')
+        norm = ds.get_normalizer()
+        for key in ['action', 'state']:
+            stats = {k: v.detach().numpy() for k, v in norm[key].get_input_stats().items()}
+            raw = ds.replay_buffer[key][:]
+            ref = raw if mode == 'all' else raw[idx]
+            check(np.allclose(stats['min'], ref.min(0)) and np.allclose(stats['max'], ref.max(0))
+                  and np.allclose(stats['mean'], ref.mean(0), atol=1e-6),
+                  f'{key} stats computed from {"all episodes" if mode == "all" else "train episodes only"}')
+            same_as_baseline = all(torch.equal(norm[key].params_dict[p], base_norm[key].params_dict[p])
+                                   for p in ['scale', 'offset'])
+            if mode == 'all':
+                check(same_as_baseline, f'{key} normalizer identical to baseline ManifeelDataset')
+            else:
+                check(not np.allclose(stats['mean'], raw.mean(0), atol=1e-6),
+                      f'{key} stats differ from all-episode stats')
+                n = norm[key].normalize(torch.from_numpy(raw[idx])).detach()
+                check(float(n.min()) >= -1 - 1e-5 and float(n.max()) <= 1 + 1e-5,
+                      f'{key} train frames normalized into [-1, 1] (min {n.min():.3f}, max {n.max():.3f})')
+        tacff_params[mode] = norm[TACFF].params_dict['scale'].detach().clone()
+        for key in ['wrist', TACRGB]:
+            check(norm[key].params_dict['scale'].tolist() == [2.0], f'{key} keeps image range normalizer')
+        mpolicy = instantiate(mcfg.policy)
+        mpolicy.set_normalizer(norm)
+        mpolicy.eval()
+        odim = mpolicy.obs_encoder.output_shape()[0]
+        gdim = mpolicy.model.down_modules[0][0].cond_encoder[1].in_features - mcfg.policy.diffusion_step_embed_dim
+        check(odim == 1543 and gdim == 3086, f'obs feature dim {odim}, global_cond_dim {gdim}')
+        with torch.no_grad():
+            torch.manual_seed(0)
+            mloss = mpolicy.compute_loss(next(iter(DataLoader(ds, batch_size=4, shuffle=True, num_workers=0))))
+        check(torch.isfinite(mloss), f'compute_loss = {mloss.item():.4f}')
+    check(torch.equal(tacff_params['all'], tacff_params['train']),
+          'TacFF mean/std normalizer unchanged by lowdim_fit_on')
     print('ALL CHECKS PASSED')
 
 
