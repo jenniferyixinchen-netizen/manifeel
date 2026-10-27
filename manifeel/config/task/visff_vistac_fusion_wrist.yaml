@@ -1,0 +1,52 @@
+# Vision (wrist) + right TacRGB + right TacFF fusion. Use with the fusion train config:
+#   python train.py --config-name=train_diffusion_fusion_workspace.yaml task=visff_vistac_fusion_wrist ...
+# (train_diffusion_workspace.yaml would apply ImageNet normalization to the standardized TacFF)
+name: vision_tacrgb_tacff_fusion
+
+image_shape: &image_shape [3, 256, 256]
+# TacFF keys: standardized per channel by the dataset (train stats only),
+# and excluded from ImageNet normalization in the obs encoder
+tacff_keys: &tacff_keys [tactile_force_field_right]
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    wrist:
+      shape: *image_shape
+      type: rgb
+    right_tactile_camera_taxim:
+      shape: [3, 256, 256]
+      type: rgb
+    tactile_force_field_right:
+      shape: [3, 10, 14]
+      type: rgb
+    state:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [6]
+
+env_runner:
+  _target_: manifeel.env_runner.vistac_pih_runner_unit.ManifeelRunner
+  shape_meta: ${shape_meta}
+  isaacgym_cfg_name: ${isaacgym_cfg_name}
+  n_test: 50 # 10
+  n_test_vis: 2 # 2 
+  test_start_seed: 100000 # 100000
+  max_steps: 500
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  past_action: ${past_action_visible}
+  tactile_size: [256, 256]
+
+dataset:
+  _target_: manifeel.dataset.manifeel_dataset_fusion.ManifeelFusionDataset
+  shape_meta: ${shape_meta}
+  zarr_path: ${dataset_path}
+  tacff_keys: *tacff_keys
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 30
